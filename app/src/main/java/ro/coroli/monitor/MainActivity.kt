@@ -29,8 +29,6 @@ import java.io.BufferedInputStream
 import java.io.DataInputStream
 import java.net.HttpURLConnection
 import java.net.Inet4Address
-import java.net.InetSocketAddress
-import java.net.Socket
 import java.net.URL
 
 class WifiSource(
@@ -52,47 +50,71 @@ class WifiSource(
         thread = null
     }
 
-    private fun rpc(host: String, method: String): String {
-        val c = URL("http://$host:8080/sony/camera").openConnection() as HttpURLConnection
-        c.requestMethod = "POST"
-        c.doOutput = true
-        c.connectTimeout = 4000
+    private fun http(url: String, body: String? = null): String {
+        val c = URL(url).openConnection() as HttpURLConnection
+        c.connectTimeout = 3000
         c.readTimeout = 8000
-        c.setRequestProperty("Content-Type", "application/json")
-        c.outputStream.use {
-            it.write("""{"method":"$method","params":[],"id":1,"version":"1.0"}""".toByteArray())
+        if (body != null) {
+            c.requestMethod = "POST"
+            c.doOutput = true
+            c.setRequestProperty("Content-Type", "application/json")
+            c.outputStream.use { it.write(body.toByteArray()) }
         }
         return c.inputStream.bufferedReader().use { it.readText() }
     }
 
+    private fun rpc(actionUrl: String, method: String): String =
+        http(
+            "$actionUrl/camera",
+            """{"method":"$method","params":[],"id":1,"version":"1.0"}"""
+        )
+
     private fun loop(hosts: List<String>) {
         try {
-            var found: String? = null
+            var xml: String? = null
+            var host: String? = null
             for (h in hosts) {
                 if (!running) return
-                onStatus("Wi-Fi: testez $h:8080 ...")
+                onStatus("Wi-Fi: caut camera la $h ...")
                 try {
-                    Socket().use { it.connect(InetSocketAddress(h, 8080), 1500) }
-                    found = h
+                    xml = http("http://$h:64321/dd.xml")
+                    host = h
                     break
                 } catch (_: Exception) { }
             }
-            val host = found
-            if (host == null) {
-                onStatus("Wi-Fi: portul 8080 nu raspunde la: ${hosts.joinToString()}")
+            if (xml == null || host == null) {
+                onStatus("Wi-Fi: camera nu raspunde la: ${hosts.joinToString()}")
                 return
             }
 
-            onStatus("Wi-Fi: conectare la $host ...")
-            try { rpc(host, "startRecMode") } catch (_: Exception) { }
-            val resp = rpc(host, "startLiveview")
-            val liveUrl = JSONObject(resp).getJSONArray("result").getString(0)
-            onStatus("Wi-Fi: live view pornit ($host)")
+            val action = Regex(
+                "<av:X_ScalarWebAPI_ActionList_URL>(.*?)</av:X_ScalarWebAPI_ActionList_URL>"
+            ).find(xml)?.groupValues?.get(1)?.trim() ?: "http://$host:10000/sony"
+            val xmlLive = Regex(
+                "<av:X_ScalarWebAPI_LiveView_URL>(.*?)</av:X_ScalarWebAPI_LiveView_URL>"
+            ).find(xml)?.groupValues?.get(1)?.trim()
+
+            onStatus("Wi-Fi: camera gasita ($host), pornesc live view")
+            try { rpc(action, "startRecMode") } catch (_: Exception) { }
+
+            var liveUrl: String? = null
+            try {
+                liveUrl = JSONObject(rpc(action, "startLiveview"))
+                    .getJSONArray("result").getString(0)
+            } catch (e: Exception) {
+                onStatus("startLiveview esuat (${e.message}), incerc adresa din dd.xml")
+            }
+            if (liveUrl == null) liveUrl = xmlLive
+            if (liveUrl == null) {
+                onStatus("Wi-Fi: nu am gasit adresa live view")
+                return
+            }
 
             val c = URL(liveUrl).openConnection() as HttpURLConnection
             c.connectTimeout = 4000
             c.readTimeout = 8000
             val ins = DataInputStream(BufferedInputStream(c.inputStream, 1 shl 16))
+            onStatus("Wi-Fi: conectat, astept imagine")
             val common = ByteArray(8)
             val ph = ByteArray(128)
             while (running) {
@@ -108,7 +130,10 @@ class WifiSource(
                 ins.readFully(data)
                 if (pad > 0) ins.skipBytes(pad)
                 if (type == 1) {
-                    BitmapFactory.decodeByteArray(data, 0, size)?.let(onFrame)
+                    BitmapFactory.decodeByteArray(data, 0, size)?.let {
+                        onFrame(it)
+                        onStatus("Wi-Fi: live view OK")
+                    }
                 }
             }
         } catch (e: Exception) {
@@ -216,7 +241,7 @@ class MainActivity : Activity() {
     private fun startWifi() {
         val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
         val hosts = LinkedHashSet<String>()
-        var myIp = "?"
+        hosts.add("192.168.122.1")
         for (n in cm.allNetworks) {
             val caps = cm.getNetworkCapabilities(n) ?: continue
             if (!caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) continue
@@ -228,21 +253,8 @@ class MainActivity : Activity() {
                     g.hostAddress?.let { hosts.add(it) }
                 }
             }
-            lp?.linkAddresses?.forEach { la ->
-                val a = la.address
-                if (a is Inet4Address) {
-                    myIp = a.hostAddress ?: "?"
-                    val b = a.address
-                    hosts.add(
-                        "${b[0].toInt() and 0xFF}.${b[1].toInt() and 0xFF}.${b[2].toInt() and 0xFF}.1"
-                    )
-                }
-            }
             break
         }
-        hosts.add("192.168.122.1")
-        hosts.add("192.168.49.1")
-        setStatus("Wi-Fi: IP telefon $myIp")
         wifi?.stop()
         wifi = WifiSource({ bmp -> runOnUiThread { image.setImageBitmap(bmp) } }, ::setStatus)
         wifi?.start(hosts.toList())
