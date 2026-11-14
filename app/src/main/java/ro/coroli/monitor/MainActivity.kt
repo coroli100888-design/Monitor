@@ -10,16 +10,20 @@ import android.graphics.Color
 import android.graphics.ColorMatrix
 import android.graphics.ColorMatrixColorFilter
 import android.graphics.Paint
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
 import android.hardware.usb.UsbConstants
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbManager
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.text.TextUtils
 import android.view.Gravity
 import android.view.View
 import android.view.WindowManager
-import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
 import android.widget.ImageView
@@ -278,8 +282,8 @@ class OverlayView(ctx: Context) : View(ctx) {
         }
         val hh = hist
         if (showHist && hh != null) {
-            val bw = w * 0.22f
-            val bh = h * 0.18f
+            val bw = w * 0.2f
+            val bh = h * 0.16f
             val x0 = 24f
             val y0 = 110f
             c.drawRect(x0, y0, x0 + bw, y0 + bh, bg)
@@ -298,14 +302,16 @@ class OverlayView(ctx: Context) : View(ctx) {
 
 class Param(
     val label: String,
-    val getM: String,
+    val availM: String,
     val setM: String,
     val isInt: Boolean,
-    val fmt: (String) -> String
+    val curM: String? = null,
+    val supM: String? = null,
+    val fmt: (String) -> String = { it }
 ) {
     var values: List<String> = emptyList()
     var idx = -1
-    var view: TextView? = null
+    var valueView: TextView? = null
     fun text(): String = if (idx in values.indices) fmt(values[idx]) else "--"
 }
 
@@ -315,8 +321,10 @@ class MainActivity : Activity() {
     private lateinit var image: ImageView
     private lateinit var overlay: OverlayView
     private lateinit var status: TextView
-    private lateinit var recDot: TextView
-    private lateinit var recBtn: Button
+    private lateinit var recTime: TextView
+    private lateinit var recInner: View
+    private lateinit var connectBtn: TextView
+    private lateinit var toolsScroll: HorizontalScrollView
     private var wifi: WifiSource? = null
     private var api: CameraApi? = null
     private var ratioIdx = 0
@@ -324,16 +332,155 @@ class MainActivity : Activity() {
     @Volatile private var firstFrame = true
     @Volatile private var recording = false
     @Volatile private var evStep = 1
+    private var recStart = 0L
+    private val handler = Handler(Looper.getMainLooper())
+    private val errLog = StringBuilder()
 
-    private val ev = Param("EV", "getAvailableExposureCompensation", "setExposureCompensation", true) { v ->
+    private val tick = object : Runnable {
+        override fun run() {
+            val s = (System.currentTimeMillis() - recStart) / 1000
+            recTime.text = String.format("●  %02d:%02d", s / 60, s % 60)
+            if (recording) handler.postDelayed(this, 1000)
+        }
+    }
+
+    private val ev = Param(
+        "EV", "getAvailableExposureCompensation", "setExposureCompensation", true
+    ) { v ->
         val n = v.toInt()
         val e = n * (if (evStep == 2) 0.5 else 1.0 / 3.0)
         String.format("%+.1f", e)
     }
-    private val iso = Param("ISO", "getAvailableIsoSpeedRate", "setIsoSpeedRate", false) { it }
-    private val fnum = Param("F", "getAvailableFNumber", "setFNumber", false) { it }
-    private val shutter = Param("S", "getAvailableShutterSpeed", "setShutterSpeed", false) { it }
+    private val iso = Param(
+        "ISO", "getAvailableIsoSpeedRate", "setIsoSpeedRate", false,
+        "getIsoSpeedRate", "getSupportedIsoSpeedRate"
+    )
+    private val fnum = Param(
+        "F", "getAvailableFNumber", "setFNumber", false,
+        "getFNumber", "getSupportedFNumber"
+    )
+    private val shutter = Param(
+        "S", "getAvailableShutterSpeed", "setShutterSpeed", false,
+        "getShutterSpeed", "getSupportedShutterSpeed"
+    )
     private val params = listOf(ev, iso, fnum, shutter)
+
+    // ---------- helpers de stil
+
+    private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+
+    private fun roundBg(color: Int, radiusDp: Int, stroke: Int = 0): GradientDrawable =
+        GradientDrawable().apply {
+            shape = GradientDrawable.RECTANGLE
+            cornerRadius = dp(radiusDp).toFloat()
+            setColor(color)
+            if (stroke != 0) setStroke(dp(1), stroke)
+        }
+
+    private fun ovalBg(color: Int, stroke: Int = 0, strokeDp: Int = 1): GradientDrawable =
+        GradientDrawable().apply {
+            shape = GradientDrawable.OVAL
+            setColor(color)
+            if (stroke != 0) setStroke(dp(strokeDp), stroke)
+        }
+
+    private fun chip(t: String): TextView = TextView(this).apply {
+        text = t
+        textSize = 13f
+        gravity = Gravity.CENTER
+        setPadding(dp(14), dp(8), dp(14), dp(8))
+    }
+
+    private fun styleChip(c: TextView, on: Boolean) {
+        if (on) {
+            c.background = roundBg(Color.argb(235, 255, 255, 255), 18)
+            c.setTextColor(Color.BLACK)
+        } else {
+            c.background = roundBg(Color.argb(150, 20, 20, 20), 18, Color.argb(60, 255, 255, 255))
+            c.setTextColor(Color.WHITE)
+        }
+    }
+
+    private fun addTo(row: LinearLayout, v: View) {
+        row.addView(v, LinearLayout.LayoutParams(-2, -2).apply {
+            setMargins(dp(4), dp(4), dp(4), dp(4))
+        })
+    }
+
+    private fun actionChip(row: LinearLayout, t: String, a: () -> Unit) {
+        val c = chip(t)
+        styleChip(c, false)
+        c.setOnClickListener { a() }
+        addTo(row, c)
+    }
+
+    private fun toggleChip(row: LinearLayout, t: String, init: Boolean, on: (Boolean) -> Unit) {
+        var s = init
+        val c = chip(t)
+        styleChip(c, s)
+        c.setOnClickListener {
+            s = !s
+            styleChip(c, s)
+            on(s)
+        }
+        addTo(row, c)
+    }
+
+    private fun circle(sizeDp: Int, label: String): TextView = TextView(this).apply {
+        text = label
+        textSize = 20f
+        gravity = Gravity.CENTER
+        setTextColor(Color.WHITE)
+        background = ovalBg(Color.argb(150, 20, 20, 20), Color.argb(90, 255, 255, 255))
+        layoutParams = LinearLayout.LayoutParams(dp(sizeDp), dp(sizeDp)).apply {
+            setMargins(0, dp(8), 0, dp(8))
+        }
+    }
+
+    private fun paramGroup(row: LinearLayout, p: Param) {
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = roundBg(Color.argb(150, 20, 20, 20), 22, Color.argb(60, 255, 255, 255))
+        }
+        val minus = TextView(this).apply {
+            text = "‹"; textSize = 24f; setTextColor(Color.WHITE)
+            gravity = Gravity.CENTER
+            setPadding(dp(14), dp(2), dp(14), dp(2))
+        }
+        minus.setOnClickListener { step(p, -1) }
+        val mid = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+        }
+        val lbl = TextView(this).apply {
+            text = p.label; textSize = 10f
+            setTextColor(Color.argb(180, 255, 255, 255))
+            gravity = Gravity.CENTER
+        }
+        val v = TextView(this).apply {
+            text = "--"; textSize = 16f
+            setTextColor(Color.WHITE)
+            typeface = Typeface.DEFAULT_BOLD
+            gravity = Gravity.CENTER
+            minWidth = dp(56)
+        }
+        p.valueView = v
+        mid.addView(lbl)
+        mid.addView(v)
+        val plus = TextView(this).apply {
+            text = "›"; textSize = 24f; setTextColor(Color.WHITE)
+            gravity = Gravity.CENTER
+            setPadding(dp(14), dp(2), dp(14), dp(2))
+        }
+        plus.setOnClickListener { step(p, 1) }
+        box.addView(minus)
+        box.addView(mid)
+        box.addView(plus)
+        addTo(row, box)
+    }
+
+    // ---------- UI
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -350,133 +497,175 @@ class MainActivity : Activity() {
         root.addView(image, -1, -1)
         root.addView(overlay, -1, -1)
 
+        // gradiente sus si jos
+        val topScrim = View(this).apply {
+            background = GradientDrawable(
+                GradientDrawable.Orientation.TOP_BOTTOM,
+                intArrayOf(Color.argb(150, 0, 0, 0), Color.TRANSPARENT)
+            )
+        }
+        root.addView(topScrim, FrameLayout.LayoutParams(-1, dp(90), Gravity.TOP))
+        val botScrim = View(this).apply {
+            background = GradientDrawable(
+                GradientDrawable.Orientation.BOTTOM_TOP,
+                intArrayOf(Color.argb(170, 0, 0, 0), Color.TRANSPARENT)
+            )
+        }
+        root.addView(botScrim, FrameLayout.LayoutParams(-1, dp(180), Gravity.BOTTOM))
+
+        // brand
         val brand = TextView(this).apply {
-            text = "Coroli Alexandru Photography"
-            setTextColor(Color.WHITE); textSize = 14f; alpha = 0.85f
-            setPadding(24, 16, 24, 16)
+            text = "CORALI ALEXANDRU PHOTOGRAPHY".replace("CORALI", "COROLI")
+            setTextColor(Color.WHITE)
+            textSize = 11f
+            letterSpacing = 0.12f
+            alpha = 0.9f
         }
-        root.addView(brand, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.START))
+        root.addView(brand, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.START).apply {
+            setMargins(dp(20), dp(16), 0, 0)
+        })
 
+        // status
         status = TextView(this).apply {
-            text = "Alege sursa: USB sau Wi-Fi"
-            setTextColor(Color.LTGRAY); textSize = 12f
-            setPadding(24, 16, 24, 16)
+            text = "Gata de conectare"
+            setTextColor(Color.WHITE)
+            textSize = 12f
+            maxLines = 2
+            maxWidth = dp(420)
+            ellipsize = TextUtils.TruncateAt.END
+            setPadding(dp(12), dp(6), dp(12), dp(6))
+            background = roundBg(Color.argb(130, 0, 0, 0), 14)
         }
-        root.addView(status, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.END))
+        root.addView(status, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.END).apply {
+            setMargins(0, dp(12), dp(16), 0)
+        })
 
-        recDot = TextView(this).apply {
-            text = "● REC"
-            setTextColor(Color.RED); textSize = 16f
-            setPadding(24, 16, 24, 16)
+        // cronometru REC
+        recTime = TextView(this).apply {
+            text = "●  00:00"
+            setTextColor(Color.WHITE)
+            textSize = 14f
+            typeface = Typeface.DEFAULT_BOLD
+            setPadding(dp(14), dp(6), dp(14), dp(6))
+            background = roundBg(Color.argb(210, 210, 30, 30), 16)
             visibility = View.GONE
         }
-        root.addView(recDot, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.CENTER_HORIZONTAL))
+        root.addView(recTime, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.CENTER_HORIZONTAL).apply {
+            setMargins(0, dp(10), 0, 0)
+        })
 
-        // ---- bara de expunere
+        // buton mare de conectare
+        connectBtn = TextView(this).apply {
+            text = "Conectare Wi-Fi"
+            textSize = 16f
+            setTextColor(Color.BLACK)
+            typeface = Typeface.DEFAULT_BOLD
+            gravity = Gravity.CENTER
+            setPadding(dp(28), dp(14), dp(28), dp(14))
+            background = roundBg(Color.argb(240, 255, 255, 255), 28)
+        }
+        connectBtn.setOnClickListener {
+            connectBtn.text = "Se conectează..."
+            startWifi()
+        }
+        root.addView(connectBtn, FrameLayout.LayoutParams(-2, -2, Gravity.CENTER))
+
+        // coloana din dreapta: Foto, REC, Unelte
+        val right = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+        }
+        val photo = circle(52, "📷")
+        photo.setOnClickListener { apiAction("Foto", "actTakePicture") }
+        right.addView(photo)
+
+        val recWrap = FrameLayout(this).apply {
+            background = ovalBg(Color.argb(90, 0, 0, 0), Color.WHITE, 4)
+            layoutParams = LinearLayout.LayoutParams(dp(84), dp(84)).apply {
+                setMargins(0, dp(8), 0, dp(8))
+            }
+        }
+        recInner = View(this)
+        recWrap.addView(recInner, FrameLayout.LayoutParams(dp(60), dp(60), Gravity.CENTER))
+        setRecUi(false)
+        recWrap.setOnClickListener { toggleRec() }
+        right.addView(recWrap)
+
+        val toolsBtn = circle(52, "⚙")
+        toolsBtn.setOnClickListener {
+            toolsScroll.visibility =
+                if (toolsScroll.visibility == View.VISIBLE) View.GONE else View.VISIBLE
+        }
+        right.addView(toolsBtn)
+        root.addView(right, FrameLayout.LayoutParams(-2, -2, Gravity.END or Gravity.CENTER_VERTICAL).apply {
+            setMargins(0, 0, dp(22), 0)
+        })
+
+        // rand expunere
         val expRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
         }
         params.forEach { paramGroup(expRow, it) }
-        val refresh = Button(this)
-        styleBtn(refresh, "↻")
+        val refresh = chip("↻")
+        styleChip(refresh, false)
         refresh.setOnClickListener { Thread { params.forEach { fetch(it) } }.start() }
-        expRow.addView(refresh)
+        addTo(expRow, refresh)
 
-        // ---- bara de unelte
+        // rand unelte
         val toolRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
         }
-        addBtn(toolRow, "USB") { startUsb() }
-        addBtn(toolRow, "Wi-Fi") { startWifi() }
-        recBtn = Button(this)
-        styleBtn(recBtn, "REC")
-        recBtn.setOnClickListener { toggleRec() }
-        toolRow.addView(recBtn)
-        addBtn(toolRow, "Foto") { apiAction("Foto", "actTakePicture") }
-        toggle(toolRow, "Grid", true) { overlay.grid = it; overlay.invalidate() }
-        addBtn(toolRow, "Cadru") {
+        actionChip(toolRow, "Wi-Fi") { startWifi() }
+        actionChip(toolRow, "USB") { startUsb() }
+        toggleChip(toolRow, "Grid", true) { overlay.grid = it; overlay.invalidate() }
+        actionChip(toolRow, "Cadru") {
             ratioIdx = (ratioIdx + 1) % ratios.size
             overlay.frameRatio = ratios[ratioIdx]; overlay.invalidate()
         }
-        toggle(toolRow, "Zebra", false) { Processor.zebra = it }
-        toggle(toolRow, "Peaking", false) { Processor.peaking = it }
-        toggle(toolRow, "False color", false) { Processor.falseColor = it }
-        toggle(toolRow, "Histograma", true) { overlay.showHist = it; overlay.invalidate() }
-        toggle(toolRow, "Umplere", false) {
+        toggleChip(toolRow, "Zebra", false) { Processor.zebra = it }
+        toggleChip(toolRow, "Peaking", false) { Processor.peaking = it }
+        toggleChip(toolRow, "False color", false) { Processor.falseColor = it }
+        toggleChip(toolRow, "Histogramă", true) { overlay.showHist = it; overlay.invalidate() }
+        toggleChip(toolRow, "Umplere", false) {
             image.scaleType = if (it) ImageView.ScaleType.CENTER_CROP else ImageView.ScaleType.FIT_CENTER
         }
-        toggle(toolRow, "Oglinda", false) { image.scaleX = if (it) -1f else 1f }
-        toggle(toolRow, "Rosu", false) { setRed(it) }
-        addBtn(toolRow, "Info") { showApiList() }
+        toggleChip(toolRow, "Oglindă", false) { image.scaleX = if (it) -1f else 1f }
+        toggleChip(toolRow, "Roșu", false) { setRed(it) }
+        actionChip(toolRow, "Info") { showInfo() }
 
-        val bottom = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.argb(140, 0, 0, 0))
+        toolsScroll = HorizontalScrollView(this).apply {
+            isHorizontalScrollBarEnabled = false
+            visibility = View.GONE
+            addView(toolRow)
         }
-        bottom.addView(HorizontalScrollView(this).apply { addView(expRow) })
-        bottom.addView(HorizontalScrollView(this).apply { addView(toolRow) })
-        root.addView(bottom, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM))
+        val expScroll = HorizontalScrollView(this).apply {
+            isHorizontalScrollBarEnabled = false
+            addView(expRow)
+        }
+        val bottom = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        bottom.addView(toolsScroll)
+        bottom.addView(expScroll)
+        root.addView(bottom, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM).apply {
+            setMargins(dp(12), 0, dp(140), dp(10))
+        })
+
         setContentView(root)
     }
 
-    // ---------- helpers UI
-
-    private fun styleBtn(b: Button, t: String) {
-        b.text = t
-        b.textSize = 12f
-        b.isAllCaps = false
-        b.minWidth = 0
-        b.minimumWidth = 0
-        b.minHeight = 0
-        b.minimumHeight = 0
-        b.setPadding(28, 14, 28, 14)
-    }
-
-    private fun addBtn(row: LinearLayout, t: String, a: () -> Unit) {
-        val b = Button(this)
-        styleBtn(b, t)
-        b.setOnClickListener { a() }
-        row.addView(b)
-    }
-
-    private fun toggle(row: LinearLayout, t: String, init: Boolean, on: (Boolean) -> Unit) {
-        var s = init
-        val b = Button(this)
-        styleBtn(b, t)
-        b.alpha = if (s) 1f else 0.5f
-        b.setOnClickListener {
-            s = !s
-            b.alpha = if (s) 1f else 0.5f
-            on(s)
+    private fun setRecUi(rec: Boolean) {
+        if (rec) {
+            recInner.background = GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                cornerRadius = dp(7).toFloat()
+                setColor(Color.rgb(230, 30, 30))
+            }
+            recInner.layoutParams = FrameLayout.LayoutParams(dp(30), dp(30), Gravity.CENTER)
+        } else {
+            recInner.background = ovalBg(Color.rgb(230, 30, 30))
+            recInner.layoutParams = FrameLayout.LayoutParams(dp(60), dp(60), Gravity.CENTER)
         }
-        row.addView(b)
-    }
-
-    private fun paramGroup(row: LinearLayout, p: Param) {
-        val lbl = TextView(this).apply {
-            text = p.label
-            setTextColor(Color.LTGRAY); textSize = 12f
-            setPadding(20, 0, 8, 0)
-        }
-        val minus = Button(this)
-        styleBtn(minus, "−")
-        minus.setOnClickListener { step(p, -1) }
-        val v = TextView(this).apply {
-            text = "--"
-            setTextColor(Color.WHITE); textSize = 14f
-            minWidth = 110
-            gravity = Gravity.CENTER
-        }
-        p.view = v
-        val plus = Button(this)
-        styleBtn(plus, "+")
-        plus.setOnClickListener { step(p, 1) }
-        row.addView(lbl)
-        row.addView(minus)
-        row.addView(v)
-        row.addView(plus)
     }
 
     private fun setRed(on: Boolean) {
@@ -497,6 +686,14 @@ class MainActivity : Activity() {
 
     private fun setStatus(s: String) = runOnUiThread { status.text = s }
 
+    private fun logErr(s: String) {
+        synchronized(errLog) {
+            errLog.append(s).append('\n')
+            if (errLog.length > 3000) errLog.delete(0, 1000)
+        }
+        setStatus(s)
+    }
+
     // ---------- Wi-Fi
 
     private fun onFrame(bmp: Bitmap) {
@@ -510,7 +707,10 @@ class MainActivity : Activity() {
             image.setImageBitmap(out)
             overlay.hist = hist
             overlay.invalidate()
-            if (first) status.text = "Wi-Fi: live view OK"
+            if (first) {
+                status.text = "Wi-Fi: live view OK"
+                connectBtn.visibility = View.GONE
+            }
         }
     }
 
@@ -545,130 +745,12 @@ class MainActivity : Activity() {
 
     private fun fetch(p: Param) {
         val a = api ?: return
+        var err: String? = null
+        var ok = false
         try {
-            val r = a.call(p.getM).getJSONArray("result")
+            val r = a.call(p.availM).getJSONArray("result")
             if (p.isInt) {
                 val cur = r.getInt(0)
                 val max = r.getInt(1)
                 val min = r.getInt(2)
-                if (r.length() > 3) evStep = r.getInt(3)
-                p.values = (min..max).map { it.toString() }
-                p.idx = p.values.indexOf(cur.toString())
-            } else {
-                val cur = r.getString(0)
-                val arr = r.getJSONArray(1)
-                p.values = (0 until arr.length()).map { arr.getString(it) }
-                p.idx = p.values.indexOf(cur)
-            }
-        } catch (e: Exception) {
-            p.values = emptyList()
-            p.idx = -1
-            setStatus("${p.label}: ${e.message}")
-        }
-        runOnUiThread { p.view?.text = p.text() }
-    }
-
-    private fun step(p: Param, d: Int) {
-        val a = api
-        if (a == null) {
-            setStatus("Conecteaza-te intai prin Wi-Fi")
-            return
-        }
-        Thread {
-            try {
-                if (p.values.isEmpty()) fetch(p)
-                if (p.values.isEmpty()) {
-                    setStatus("${p.label}: nu pot citi valorile (schimba modul camerei)")
-                    return@Thread
-                }
-                val n = (p.idx + d).coerceIn(0, p.values.size - 1)
-                val v = p.values[n]
-                a.call(p.setM, if (p.isInt) "[$v]" else "[\"$v\"]")
-                p.idx = n
-            } catch (e: Exception) {
-                setStatus("${p.label}: ${e.message}")
-            }
-            runOnUiThread { p.view?.text = p.text() }
-        }.start()
-    }
-
-    private fun toggleRec() {
-        val a = api
-        if (a == null) {
-            setStatus("Conecteaza-te intai prin Wi-Fi")
-            return
-        }
-        Thread {
-            try {
-                if (!recording) {
-                    a.call("startMovieRec")
-                    recording = true
-                } else {
-                    a.call("stopMovieRec")
-                    recording = false
-                }
-            } catch (e: Exception) {
-                setStatus("REC: ${e.message} (camera pe modul Video?)")
-            }
-            runOnUiThread {
-                recDot.visibility = if (recording) View.VISIBLE else View.GONE
-                recBtn.text = if (recording) "STOP" else "REC"
-            }
-        }.start()
-    }
-
-    private fun apiAction(label: String, method: String) {
-        val a = api
-        if (a == null) {
-            setStatus("Conecteaza-te intai prin Wi-Fi")
-            return
-        }
-        Thread {
-            try {
-                a.call(method)
-                setStatus("$label: ok")
-            } catch (e: Exception) {
-                setStatus("$label: ${e.message}")
-            }
-        }.start()
-    }
-
-    private fun showApiList() {
-        val a = api
-        if (a == null) {
-            setStatus("Conecteaza-te intai prin Wi-Fi")
-            return
-        }
-        Thread {
-            val txt = try {
-                val arr = a.call("getAvailableApiList").getJSONArray("result").getJSONArray(0)
-                (0 until arr.length()).joinToString(", ") { arr.getString(it) }
-            } catch (e: Exception) {
-                "Eroare: ${e.message}"
-            }
-            runOnUiThread {
-                AlertDialog.Builder(this)
-                    .setTitle("Functii disponibile pe camera")
-                    .setMessage(txt)
-                    .setPositiveButton("OK", null)
-                    .show()
-            }
-        }.start()
-    }
-
-    // ---------- USB
-
-    private fun startUsb() {
-        wifi?.stop()
-        val d = UsbSource.findVideoDevices(this)
-        setStatus(
-            if (d.isEmpty()) "USB: niciun dispozitiv video gasit"
-            else "USB: gasit ${d[0].productName ?: d[0].deviceName} (previzualizare in pasul urmator)"
-        )
-    }
-
-    override fun onPause() {
-        super.onPause()
-        wifi?.stop()
-    }
-}
+                if (r.length() > 3) evStep =
