@@ -753,4 +753,148 @@ class MainActivity : Activity() {
                 val cur = r.getInt(0)
                 val max = r.getInt(1)
                 val min = r.getInt(2)
-                if (r.length() > 3) evStep =
+                if (r.length() > 3) evStep = r.getInt(3)
+                p.values = (min..max).map { it.toString() }
+                p.idx = p.values.indexOf(cur.toString())
+            } else {
+                val cur = r.getString(0)
+                val arr = r.getJSONArray(1)
+                p.values = (0 until arr.length()).map { arr.getString(it) }
+                p.idx = p.values.indexOf(cur)
+            }
+            ok = p.values.isNotEmpty()
+        } catch (e: Exception) {
+            err = e.message
+        }
+        val cm = p.curM
+        val sm = p.supM
+        if (!ok && cm != null && sm != null) {
+            try {
+                val cur = a.call(cm).getJSONArray("result").get(0).toString()
+                val sup = a.call(sm).getJSONArray("result").getJSONArray(0)
+                p.values = (0 until sup.length()).map { sup.getString(it) }
+                p.idx = p.values.indexOf(cur)
+                ok = p.values.isNotEmpty()
+            } catch (e: Exception) {
+                err = (err ?: "") + " | " + e.message
+            }
+        }
+        if (!ok) {
+            p.values = emptyList()
+            p.idx = -1
+            logErr("${p.label}: $err")
+        }
+        runOnUiThread { p.valueView?.text = p.text() }
+    }
+
+    private fun step(p: Param, d: Int) {
+        val a = api
+        if (a == null) {
+            setStatus("Conectează-te întâi prin Wi-Fi")
+            return
+        }
+        Thread {
+            try {
+                if (p.values.isEmpty()) fetch(p)
+                if (p.values.isEmpty()) {
+                    logErr("${p.label}: nu pot citi valorile (verifica modul camerei)")
+                    return@Thread
+                }
+                val n = (p.idx + d).coerceIn(0, p.values.size - 1)
+                val v = p.values[n]
+                a.call(p.setM, if (p.isInt) "[$v]" else "[\"$v\"]")
+                p.idx = n
+            } catch (e: Exception) {
+                logErr("${p.label}: ${e.message}")
+            }
+            runOnUiThread { p.valueView?.text = p.text() }
+        }.start()
+    }
+
+    private fun toggleRec() {
+        val a = api
+        if (a == null) {
+            setStatus("Conectează-te întâi prin Wi-Fi")
+            return
+        }
+        Thread {
+            try {
+                if (!recording) {
+                    a.call("startMovieRec")
+                    recording = true
+                } else {
+                    a.call("stopMovieRec")
+                    recording = false
+                }
+            } catch (e: Exception) {
+                logErr("REC: ${e.message} (camera pe modul Video?)")
+            }
+            runOnUiThread {
+                setRecUi(recording)
+                if (recording) {
+                    recStart = System.currentTimeMillis()
+                    recTime.visibility = View.VISIBLE
+                    handler.post(tick)
+                } else {
+                    recTime.visibility = View.GONE
+                }
+            }
+        }.start()
+    }
+
+    private fun apiAction(label: String, method: String) {
+        val a = api
+        if (a == null) {
+            setStatus("Conectează-te întâi prin Wi-Fi")
+            return
+        }
+        Thread {
+            try {
+                a.call(method)
+                setStatus("$label: ok")
+            } catch (e: Exception) {
+                logErr("$label: ${e.message}")
+            }
+        }.start()
+    }
+
+    private fun showInfo() {
+        val a = api
+        if (a == null) {
+            setStatus("Conectează-te întâi prin Wi-Fi")
+            return
+        }
+        Thread {
+            val apis = try {
+                val arr = a.call("getAvailableApiList").getJSONArray("result").getJSONArray(0)
+                (0 until arr.length()).joinToString(", ") { arr.getString(it) }
+            } catch (e: Exception) {
+                "Eroare: ${e.message}"
+            }
+            val errs = synchronized(errLog) { errLog.toString() }
+            runOnUiThread {
+                AlertDialog.Builder(this)
+                    .setTitle("Info cameră")
+                    .setMessage("FUNCTII DISPONIBILE:\n$apis\n\nERORI:\n$errs")
+                    .setPositiveButton("OK", null)
+                    .show()
+            }
+        }.start()
+    }
+
+    // ---------- USB
+
+    private fun startUsb() {
+        wifi?.stop()
+        val d = UsbSource.findVideoDevices(this)
+        setStatus(
+            if (d.isEmpty()) "USB: niciun dispozitiv video găsit"
+            else "USB: găsit ${d[0].productName ?: d[0].deviceName} (previzualizare în pasul următor)"
+        )
+    }
+
+    override fun onPause() {
+        super.onPause()
+        wifi?.stop()
+    }
+}
