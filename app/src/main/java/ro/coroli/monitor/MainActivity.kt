@@ -1,40 +1,143 @@
 package ro.coroli.monitor
 
+import android.app.Activity
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Paint
+import android.hardware.usb.UsbConstants
+import android.hardware.usb.UsbDevice
+import android.hardware.usb.UsbManager
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.os.Bundle
 import android.view.Gravity
-import android.view.View    private fun startWifi() {
-        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-        var host = "192.168.122.1"
-        for (n in cm.allNetworks) {
-            val caps = cm.getNetworkCapabilities(n) ?: continue
-            if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
-                cm.bindProcessToNetwork(n)
-                val gw = cm.getLinkProperties(n)?.routes
-                    ?.firstOrNull { it.gateway is java.net.Inet4Address }
-                    ?.gateway?.hostAddress
-                if (gw != null) host = gw
-                break
-            }
-        }
-        setStatus("Wi-Fi: incerc $host")
-        wifi?.stop()
-        wifi = WifiSource({ bmp -> runOnUiThread { image.setImageBitmap(bmp) } }, ::setStatus)
-        wifi?.start(host)
-    }
+import android.view.View
 import android.view.WindowManager
 import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
-import android.app.Activity
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import org.json.JSONObject
+import java.io.BufferedInputStream
+import java.io.DataInputStream
+import java.net.HttpURLConnection
+import java.net.URL
+
+class WifiSource(
+    private val onFrame: (Bitmap) -> Unit,
+    private val onStatus: (String) -> Unit
+) {
+    @Volatile private var running = false
+    private var thread: Thread? = null
+
+    fun start(host: String = "192.168.122.1") {
+        stop()
+        running = true
+        thread = Thread { loop(host) }.also { it.start() }
+    }
+
+    fun stop() {
+        running = false
+        thread?.interrupt()
+        thread = null
+    }
+
+    private fun rpc(host: String, method: String): String {
+        val c = URL("http://$host:8080/sony/camera").openConnection() as HttpURLConnection
+        c.requestMethod = "POST"
+        c.doOutput = true
+        c.connectTimeout = 4000
+        c.readTimeout = 8000
+        c.setRequestProperty("Content-Type", "application/json")
+        c.outputStream.use {
+            it.write("""{"method":"$method","params":[],"id":1,"version":"1.0"}""".toByteArray())
+        }
+        return c.inputStream.bufferedReader().use { it.readText() }
+    }
+
+    private fun loop(host: String) {
+        try {
+            onStatus("Wi-Fi: conectare la $host ...")
+            try { rpc(host, "startRecMode") } catch (_: Exception) { }
+            val resp = rpc(host, "startLiveview")
+            val liveUrl = JSONObject(resp).getJSONArray("result").getString(0)
+            onStatus("Wi-Fi: live view pornit")
+
+            val c = URL(liveUrl).openConnection() as HttpURLConnection
+            c.connectTimeout = 4000
+            c.readTimeout = 8000
+            val ins = DataInputStream(BufferedInputStream(c.inputStream, 1 shl 16))
+            val common = ByteArray(8)
+            val ph = ByteArray(128)
+            while (running) {
+                ins.readFully(common)
+                if (common[0] != 0xFF.toByte()) continue
+                val type = common[1].toInt() and 0xFF
+                ins.readFully(ph)
+                val size = ((ph[4].toInt() and 0xFF) shl 16) or
+                        ((ph[5].toInt() and 0xFF) shl 8) or
+                        (ph[6].toInt() and 0xFF)
+                val pad = ph[7].toInt() and 0xFF
+                val data = ByteArray(size)
+                ins.readFully(data)
+                if (pad > 0) ins.skipBytes(pad)
+                if (type == 1) {
+                    BitmapFactory.decodeByteArray(data, 0, size)?.let(onFrame)
+                }
+            }
+        } catch (e: Exception) {
+            if (running) onStatus("Wi-Fi eroare ($host): ${e.message}")
+        }
+    }
+}
+
+object UsbSource {
+    fun findVideoDevices(ctx: Context): List<UsbDevice> {
+        val m = ctx.getSystemService(Context.USB_SERVICE) as UsbManager
+        return m.deviceList.values.filter { d ->
+            (0 until d.interfaceCount).any {
+                d.getInterface(it).interfaceClass == UsbConstants.USB_CLASS_VIDEO
+            }
+        }
+    }
+}
+
+class OverlayView(ctx: Context) : View(ctx) {
+    var grid = true
+    var center = true
+    var frameRatio = 0f
+
+    private val p = Paint().apply {
+        color = Color.argb(160, 255, 255, 255)
+        strokeWidth = 2f
+        style = Paint.Style.STROKE
+    }
+
+    override fun onDraw(c: Canvas) {
+        val w = width.toFloat(); val h = height.toFloat()
+        if (grid) {
+            for (i in 1..2) {
+                c.drawLine(w * i / 3, 0f, w * i / 3, h, p)
+                c.drawLine(0f, h * i / 3, w, h * i / 3, p)
+            }
+        }
+        if (center) {
+            c.drawLine(w / 2 - 30, h / 2, w / 2 + 30, h / 2, p)
+            c.drawLine(w / 2, h / 2 - 30, w / 2, h / 2 + 30, p)
+        }
+        if (frameRatio > 0f) {
+            val fh = w / frameRatio
+            if (fh < h) c.drawRect(0f, (h - fh) / 2, w, (h + fh) / 2, p)
+        }
+    }
+}
 
 class MainActivity : Activity() {
     private lateinit var image: ImageView
@@ -91,21 +194,24 @@ class MainActivity : Activity() {
 
     private fun setStatus(s: String) = runOnUiThread { status.text = s }
 
-    private fun bindToWifi() {
+    private fun startWifi() {
         val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        var host = "192.168.122.1"
         for (n in cm.allNetworks) {
             val caps = cm.getNetworkCapabilities(n) ?: continue
             if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
-                cm.bindProcessToNetwork(n); return
+                cm.bindProcessToNetwork(n)
+                val gw = cm.getLinkProperties(n)?.routes
+                    ?.firstOrNull { it.gateway is java.net.Inet4Address }
+                    ?.gateway?.hostAddress
+                if (gw != null) host = gw
+                break
             }
         }
-    }
-
-    private fun startWifi() {
-        bindToWifi()
+        setStatus("Wi-Fi: incerc $host")
         wifi?.stop()
         wifi = WifiSource({ bmp -> runOnUiThread { image.setImageBitmap(bmp) } }, ::setStatus)
-        wifi?.start()
+        wifi?.start(host)
     }
 
     private fun startUsb() {
