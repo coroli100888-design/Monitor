@@ -28,6 +28,9 @@ import org.json.JSONObject
 import java.io.BufferedInputStream
 import java.io.DataInputStream
 import java.net.HttpURLConnection
+import java.net.Inet4Address
+import java.net.InetSocketAddress
+import java.net.Socket
 import java.net.URL
 
 class WifiSource(
@@ -37,10 +40,10 @@ class WifiSource(
     @Volatile private var running = false
     private var thread: Thread? = null
 
-    fun start(host: String = "192.168.122.1") {
+    fun start(hosts: List<String>) {
         stop()
         running = true
-        thread = Thread { loop(host) }.also { it.start() }
+        thread = Thread { loop(hosts) }.also { it.start() }
     }
 
     fun stop() {
@@ -62,13 +65,29 @@ class WifiSource(
         return c.inputStream.bufferedReader().use { it.readText() }
     }
 
-    private fun loop(host: String) {
+    private fun loop(hosts: List<String>) {
         try {
+            var found: String? = null
+            for (h in hosts) {
+                if (!running) return
+                onStatus("Wi-Fi: testez $h:8080 ...")
+                try {
+                    Socket().use { it.connect(InetSocketAddress(h, 8080), 1500) }
+                    found = h
+                    break
+                } catch (_: Exception) { }
+            }
+            val host = found
+            if (host == null) {
+                onStatus("Wi-Fi: portul 8080 nu raspunde la: ${hosts.joinToString()}")
+                return
+            }
+
             onStatus("Wi-Fi: conectare la $host ...")
             try { rpc(host, "startRecMode") } catch (_: Exception) { }
             val resp = rpc(host, "startLiveview")
             val liveUrl = JSONObject(resp).getJSONArray("result").getString(0)
-            onStatus("Wi-Fi: live view pornit")
+            onStatus("Wi-Fi: live view pornit ($host)")
 
             val c = URL(liveUrl).openConnection() as HttpURLConnection
             c.connectTimeout = 4000
@@ -93,7 +112,7 @@ class WifiSource(
                 }
             }
         } catch (e: Exception) {
-            if (running) onStatus("Wi-Fi eroare ($host): ${e.message}")
+            if (running) onStatus("Wi-Fi eroare: ${e.message}")
         }
     }
 }
@@ -196,22 +215,37 @@ class MainActivity : Activity() {
 
     private fun startWifi() {
         val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-        var host = "192.168.122.1"
+        val hosts = LinkedHashSet<String>()
+        var myIp = "?"
         for (n in cm.allNetworks) {
             val caps = cm.getNetworkCapabilities(n) ?: continue
-            if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
-                cm.bindProcessToNetwork(n)
-                val gw = cm.getLinkProperties(n)?.routes
-                    ?.firstOrNull { it.gateway is java.net.Inet4Address }
-                    ?.gateway?.hostAddress
-                if (gw != null) host = gw
-                break
+            if (!caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) continue
+            cm.bindProcessToNetwork(n)
+            val lp = cm.getLinkProperties(n)
+            lp?.routes?.forEach { r ->
+                val g = r.gateway
+                if (g is Inet4Address && !g.isAnyLocalAddress) {
+                    g.hostAddress?.let { hosts.add(it) }
+                }
             }
+            lp?.linkAddresses?.forEach { la ->
+                val a = la.address
+                if (a is Inet4Address) {
+                    myIp = a.hostAddress ?: "?"
+                    val b = a.address
+                    hosts.add(
+                        "${b[0].toInt() and 0xFF}.${b[1].toInt() and 0xFF}.${b[2].toInt() and 0xFF}.1"
+                    )
+                }
+            }
+            break
         }
-        setStatus("Wi-Fi: incerc $host")
+        hosts.add("192.168.122.1")
+        hosts.add("192.168.49.1")
+        setStatus("Wi-Fi: IP telefon $myIp")
         wifi?.stop()
         wifi = WifiSource({ bmp -> runOnUiThread { image.setImageBitmap(bmp) } }, ::setStatus)
-        wifi?.start(host)
+        wifi?.start(hosts.toList())
     }
 
     private fun startUsb() {
