@@ -6,7 +6,25 @@ import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.os.Bundle
 import android.view.Gravity
-import android.view.View
+import android.view.View    private fun startWifi() {
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        var host = "192.168.122.1"
+        for (n in cm.allNetworks) {
+            val caps = cm.getNetworkCapabilities(n) ?: continue
+            if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
+                cm.bindProcessToNetwork(n)
+                val gw = cm.getLinkProperties(n)?.routes
+                    ?.firstOrNull { it.gateway is java.net.Inet4Address }
+                    ?.gateway?.hostAddress
+                if (gw != null) host = gw
+                break
+            }
+        }
+        setStatus("Wi-Fi: incerc $host")
+        wifi?.stop()
+        wifi = WifiSource({ bmp -> runOnUiThread { image.setImageBitmap(bmp) } }, ::setStatus)
+        wifi?.start(host)
+    }
 import android.view.WindowManager
 import android.widget.Button
 import android.widget.FrameLayout
